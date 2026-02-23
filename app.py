@@ -10,13 +10,11 @@ st.title("Questrade 实时订单与行情监控")
 # ================= 侧边栏：账户连接与状态管理 =================
 st.sidebar.header("🔑 账户连接")
 
-# 1. 初始化会话记忆 (Session State)
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.access_token = ''
     st.session_state.api_server = ''
 
-# 2. 如果还没登录，显示输入框和登录按钮
 if not st.session_state.authenticated:
     refresh_token = st.sidebar.text_input("请输入您的 Refresh Token (钥匙):", type="password")
     if st.sidebar.button("🔌 验证并连接"):
@@ -24,19 +22,16 @@ if not st.session_state.authenticated:
             url = f"https://login.questrade.com/oauth2/token?grant_type=refresh_token&refresh_token={refresh_token}"
             response = requests.get(url)
             if response.status_code == 200:
-                # 登录成功，把凭证锁进 session_state
                 auth_data = response.json()
                 st.session_state.access_token = auth_data['access_token']
                 st.session_state.api_server = auth_data['api_server']
                 st.session_state.authenticated = True
-                st.rerun() # 刷新网页，进入监控界面
+                st.rerun()
             else:
                 st.sidebar.error("❌ Token 无效或已被使用过，请重新生成。")
     
     st.info("👈 请在左侧输入您的 Refresh Token 并点击连接。")
-    st.stop() # 停止运行后续代码，直到登录成功
-
-# 3. 如果已经登录，显示成功状态和断开按钮
+    st.stop()
 else:
     st.sidebar.success("✅ 账户已安全连接！")
     if st.sidebar.button("断开连接 / 更换账户"):
@@ -62,14 +57,12 @@ def fetch_data(api_server, access_token, endpoint):
     response = requests.get(f"{api_server}{endpoint}", headers=headers)
     return response.json()
 
-# 从内存保险柜中取出凭证
 access_token = st.session_state.access_token
 api_server = st.session_state.api_server
 
-# ================= 获取账户列表 =================
 accounts_data = fetch_data(api_server, access_token, "v1/accounts")
 if not accounts_data.get('accounts'):
-    st.error("未找到任何交易账户，API Token 权限可能设置有误。")
+    st.error("未找到任何交易账户。")
     st.stop()
 
 account_dict = {f"{acc['type']} - {acc['number']}": acc['number'] for acc in accounts_data['accounts']}
@@ -78,7 +71,7 @@ account_id = account_dict[selected_account_name]
 
 table_placeholder = st.empty()
 
-# ================= 主循环：抓取与数据处理 =================
+# ================= 主循环 =================
 while True:
     try:
         now = datetime.now(timezone.utc)
@@ -89,9 +82,8 @@ while True:
         endpoint = f"v1/accounts/{account_id}/orders?startTime={start_str}&endTime={end_str}"
         orders_data = fetch_data(api_server, access_token, endpoint)
         
-        # 捕捉 Token 过期的情况 (Questrade 的 Access Token 生命周期一般为 30 分钟)
         if 'code' in orders_data and orders_data['code'] == 1015:
-            st.warning("⚠️ 安全连接已超时 (30分钟)，请点击左侧'断开连接'并重新输入新的 Token。")
+            st.warning("⚠️ 安全连接已超时 (30分钟)，请断开连接重新输入。")
             st.stop()
             
         orders = orders_data.get('orders', [])
@@ -102,10 +94,12 @@ while True:
             else:
                 df_orders = pd.DataFrame(orders)[['id', 'symbol', 'symbolId', 'side', 'totalQuantity', 'limitPrice', 'state', 'updateTime']]
                 
-                # 排序与去重
+                # --- 核心修复：按“股票代码+买卖方向+数量+价格”去重，彻底消灭 Questrade 乱变 ID 的问题 ---
                 df_orders['updateTime'] = pd.to_datetime(df_orders['updateTime'])
                 df_orders = df_orders.sort_values(by='updateTime', ascending=True)
-                df_orders = df_orders.drop_duplicates(subset=['id'], keep='last')
+                
+                # 使用业务逻辑特征进行去重，保留最新状态
+                df_orders = df_orders.drop_duplicates(subset=['symbolId', 'side', 'totalQuantity', 'limitPrice'], keep='last')
                 
                 # 应用过滤规则
                 df_orders = df_orders[df_orders['side'].isin(filter_side)]
@@ -123,11 +117,10 @@ while True:
                 if df_orders.empty:
                     st.warning("根据您左侧的筛选条件，当前没有符合要求的订单。")
                 else:
-                    # 使用 Markham, Ontario 对应的北美东部时间 (EST/EDT)
                     df_orders['updateTime'] = df_orders['updateTime'].dt.tz_convert('America/Toronto').dt.strftime('%m-%d %H:%M:%S')
                     
                     df_orders.rename(columns={
-                        'id': '订单编号', 
+                        'id': '底层ID', 
                         'symbol': '股票代码', 
                         'side': '买/卖', 
                         'totalQuantity': '数量', 
@@ -144,10 +137,10 @@ while True:
                     df_quotes = df_quotes.drop_duplicates(subset=['symbolId'])
                     df_quotes.rename(columns={'lastTradePrice': '当前最新价', 'bidPrice': '买一价', 'askPrice': '卖一价'}, inplace=True)
                     
-                    df_final = pd.merge(df_orders, df_quotes, on='symbolId', how='left').drop(columns=['symbolId'])
+                    df_final = pd.merge(df_orders, df_quotes, on='symbolId', how='left').drop(columns=['symbolId', '底层ID'])
                     df_final['距离现价差额'] = df_final['挂单价格'] - df_final['当前最新价']
                     
-                    cols = ['更新时间(多伦多)', '订单编号', '股票代码', '买/卖', '数量', '挂单价格', '状态', '当前最新价', '买一价', '卖一价', '距离现价差额']
+                    cols = ['更新时间(多伦多)', '股票代码', '买/卖', '数量', '挂单价格', '状态', '当前最新价', '买一价', '卖一价', '距离现价差额']
                     df_final = df_final[cols]
                     
                     def highlight_diff(val):
@@ -169,6 +162,6 @@ while True:
             st.caption(f"🔄 自动刷新中... | 最后更新时间: {time.strftime('%H:%M:%S')}")
             
     except Exception as e:
-        st.error(f"网络请求发生错误，请检查网络或确认有没有选错过滤条件。错误信息: {e}")
+        st.error(f"网络请求发生错误。错误信息: {e}")
         
     time.sleep(refresh_rate)
