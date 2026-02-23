@@ -152,4 +152,6 @@ while True:
             st.caption(f"🔄 自动刷新中... | 最后更新时间: {time.strftime('%H:%M:%S')}")
             
     except Exception as e:
-        st.error(f"网络请求发生错误，请检查网络
+        st.error(f"网络请求发生错误，请检查网络或确认有没有选错过滤条件。错误信息: {e}")
+        
+    time.sleep(refresh_rate)
