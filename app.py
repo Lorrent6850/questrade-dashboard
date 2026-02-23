@@ -4,7 +4,7 @@ import pandas as pd
 import time
 
 st.set_page_config(page_title="Questrade 实时看板", layout="wide")
-st.title("📈 客户专属：Questrade 实时挂单监控")
+st.title("Questrade 实时挂单监控")
 
 # 侧边栏：让客户输入 Token
 st.sidebar.header("🔑 账户连接")
