@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import time
+from datetime import datetime, timedelta, timezone # 核心新增：时间处理库
 
 st.set_page_config(page_title="Questrade 实时看板", layout="wide")
 st.title("Questrade 实时挂单监控")
@@ -34,13 +35,12 @@ auth_data = get_access_token(refresh_token)
 access_token = auth_data['access_token']
 api_server = auth_data['api_server']
 
-# 2. 获取所有账户，并在侧边栏生成下拉菜单供客户选择
+# 2. 获取所有账户并在侧边栏生成下拉菜单
 accounts_data = fetch_data(api_server, access_token, "v1/accounts")
 if not accounts_data.get('accounts'):
     st.error("未找到任何交易账户。")
     st.stop()
 
-# 提取账户信息并制作成字典 { 'Cash - 40133875': '40133875', ... }
 account_dict = {f"{acc['type']} - {acc['number']}": acc['number'] for acc in accounts_data['accounts']}
 selected_account_name = st.sidebar.selectbox("🏦 请选择要查看的交易账户:", list(account_dict.keys()))
 account_id = account_dict[selected_account_name]
@@ -51,11 +51,21 @@ table_placeholder = st.empty()
 # 3. 循环刷新
 while True:
     try:
-        # 获取所有挂单
-        orders_data = fetch_data(api_server, access_token, f"v1/accounts/{account_id}/orders")
+        # --- 核心修复：强制指定时间范围 ---
+        # 往前推 90 天，确保抓住所有历史 GTC 挂单
+        now = datetime.now(timezone.utc)
+        start_time = now - timedelta(days=90)
         
-        # 修复核心：将 Accepted, Open, Suspended 等活跃状态都包含进来
-        active_states = ['Open', 'Accepted', 'Suspended', 'Pending']
+        # 格式化为 Questrade 要求的 UTC 字符串 (带 'Z')
+        start_str = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        # 将时间参数加入请求链接
+        endpoint = f"v1/accounts/{account_id}/orders?startTime={start_str}&endTime={end_str}"
+        orders_data = fetch_data(api_server, access_token, endpoint)
+        
+        # 把截图里出现的 Activated 状态也加进去
+        active_states = ['Open', 'Accepted', 'Suspended', 'Pending', 'Activated']
         orders = [o for o in orders_data.get('orders', []) if o['state'] in active_states]
         
         with table_placeholder.container():
@@ -77,15 +87,13 @@ while True:
                 # 合并数据
                 df_final = pd.merge(df_orders, df_quotes, on='symbolId', how='left').drop(columns=['symbolId'])
                 
-                # 计算价差：如果是买单，价差 = 挂单价 - 最新价；卖单逻辑相反，但为了简单直观，这里统一用差值
+                # 计算差价
                 df_final['距离现价差额'] = df_final['挂单价格'] - df_final['当前最新价']
                 
                 def highlight_diff(val):
-                    # 距离现价越近越有可能成交，这里简单做个颜色区分
                     color = '#ff4b4b' if val < 0 else '#09ab3b'
                     return f'color: {color}; font-weight: bold'
                 
-                # 格式化输出
                 styled_df = df_final.style.map(highlight_diff, subset=['距离现价差额']).format("{:.2f}", subset=['挂单价格', '当前最新价', '买一价', '卖一价', '距离现价差额'])
                 
                 st.dataframe(styled_df, use_container_width=True, hide_index=True)
