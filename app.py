@@ -104,4 +104,71 @@ while True:
                 
                 # 排序与去重
                 df_orders['updateTime'] = pd.to_datetime(df_orders['updateTime'])
-                df_orders = df_orders.sort_values(by='
+                df_orders = df_orders.sort_values(by='updateTime', ascending=True)
+                df_orders = df_orders.drop_duplicates(subset=['id'], keep='last')
+                
+                # 应用过滤规则
+                df_orders = df_orders[df_orders['side'].isin(filter_side)]
+                
+                allowed_states = []
+                if "未成交 (Active)" in filter_status:
+                    allowed_states.extend(['Open', 'Accepted', 'Suspended', 'Pending', 'Activated'])
+                if "已成交 (Executed)" in filter_status:
+                    allowed_states.extend(['Executed'])
+                if "已取消 (Canceled)" in filter_status:
+                    allowed_states.extend(['Canceled'])
+                
+                df_orders = df_orders[df_orders['state'].isin(allowed_states)]
+                
+                if df_orders.empty:
+                    st.warning("根据您左侧的筛选条件，当前没有符合要求的订单。")
+                else:
+                    # 使用 Markham, Ontario 对应的北美东部时间 (EST/EDT)
+                    df_orders['updateTime'] = df_orders['updateTime'].dt.tz_convert('America/Toronto').dt.strftime('%m-%d %H:%M:%S')
+                    
+                    df_orders.rename(columns={
+                        'id': '订单编号', 
+                        'symbol': '股票代码', 
+                        'side': '买/卖', 
+                        'totalQuantity': '数量', 
+                        'limitPrice': '挂单价格', 
+                        'state': '状态',
+                        'updateTime': '更新时间(多伦多)' 
+                    }, inplace=True)
+                    
+                    unique_symbol_ids = df_orders['symbolId'].unique()
+                    symbol_ids_str = ",".join([str(sid) for sid in unique_symbol_ids])
+                    
+                    quotes_data = fetch_data(api_server, access_token, f"v1/markets/quotes?ids={symbol_ids_str}")
+                    df_quotes = pd.DataFrame(quotes_data.get('quotes', []))[['symbolId', 'lastTradePrice', 'bidPrice', 'askPrice']]
+                    df_quotes = df_quotes.drop_duplicates(subset=['symbolId'])
+                    df_quotes.rename(columns={'lastTradePrice': '当前最新价', 'bidPrice': '买一价', 'askPrice': '卖一价'}, inplace=True)
+                    
+                    df_final = pd.merge(df_orders, df_quotes, on='symbolId', how='left').drop(columns=['symbolId'])
+                    df_final['距离现价差额'] = df_final['挂单价格'] - df_final['当前最新价']
+                    
+                    cols = ['更新时间(多伦多)', '订单编号', '股票代码', '买/卖', '数量', '挂单价格', '状态', '当前最新价', '买一价', '卖一价', '距离现价差额']
+                    df_final = df_final[cols]
+                    
+                    def highlight_diff(val):
+                        if pd.isna(val): return ''
+                        color = '#ff4b4b' if val < 0 else '#09ab3b'
+                        return f'color: {color}; font-weight: bold'
+                    
+                    def highlight_state(val):
+                        if val == 'Executed': return 'color: #09ab3b; font-weight: bold' 
+                        elif val == 'Canceled': return 'color: #888888' 
+                        else: return 'color: #0078ff' 
+                    
+                    styled_df = df_final.style.map(highlight_diff, subset=['距离现价差额']) \
+                                              .map(highlight_state, subset=['状态']) \
+                                              .format("{:.2f}", subset=['挂单价格', '当前最新价', '买一价', '卖一价', '距离现价差额'])
+                    
+                    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                
+            st.caption(f"🔄 自动刷新中... | 最后更新时间: {time.strftime('%H:%M:%S')}")
+            
+    except Exception as e:
+        st.error(f"网络请求发生错误，请检查网络或确认有没有选错过滤条件。错误信息: {e}")
+        
+    time.sleep(refresh_rate)
