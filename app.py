@@ -2,10 +2,10 @@ import streamlit as st
 import requests
 import pandas as pd
 import time
-from datetime import datetime, timedelta, timezone # 核心新增：时间处理库
+from datetime import datetime, timedelta, timezone
 
 st.set_page_config(page_title="Questrade 实时看板", layout="wide")
-st.title("Questrade 实时挂单监控")
+st.title("📈 客户专属：Questrade 实时挂单监控")
 
 # 侧边栏：让客户输入 Token
 st.sidebar.header("🔑 账户连接")
@@ -51,20 +51,15 @@ table_placeholder = st.empty()
 # 3. 循环刷新
 while True:
     try:
-        # --- 核心修复：强制指定时间范围 ---
-        # 往前推 90 天，确保抓住所有历史 GTC 挂单
+        # 强制指定时间范围，往前推 90 天
         now = datetime.now(timezone.utc)
         start_time = now - timedelta(days=90)
-        
-        # 格式化为 Questrade 要求的 UTC 字符串 (带 'Z')
         start_str = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         
-        # 将时间参数加入请求链接
         endpoint = f"v1/accounts/{account_id}/orders?startTime={start_str}&endTime={end_str}"
         orders_data = fetch_data(api_server, access_token, endpoint)
         
-        # 把截图里出现的 Activated 状态也加进去
         active_states = ['Open', 'Accepted', 'Suspended', 'Pending', 'Activated']
         orders = [o for o in orders_data.get('orders', []) if o['state'] in active_states]
         
@@ -72,16 +67,23 @@ while True:
             if not orders:
                 st.success(f"当前账户 {selected_account_name} 没有正在等待成交的挂单。")
             else:
-                # 整理订单数据
                 df_orders = pd.DataFrame(orders)[['id', 'symbol', 'symbolId', 'side', 'totalQuantity', 'limitPrice', 'state']]
+                
+                # --- 安全网 1：防止抓取到重复的同一个订单 ---
+                df_orders = df_orders.drop_duplicates(subset=['id'])
+                
                 df_orders.rename(columns={'id': '订单编号', 'symbol': '股票代码', 'side': '买/卖', 'totalQuantity': '数量', 'limitPrice': '挂单价格', 'state': '状态'}, inplace=True)
                 
-                # 获取实时行情
-                symbol_ids = ",".join([str(sid) for sid in df_orders['symbolId'].tolist()])
-                quotes_data = fetch_data(api_server, access_token, f"v1/markets/quotes?ids={symbol_ids}")
+                # --- 核心修复：只提取不重复的股票 ID 去请求报价 ---
+                unique_symbol_ids = df_orders['symbolId'].unique()
+                symbol_ids_str = ",".join([str(sid) for sid in unique_symbol_ids])
                 
-                # 整理行情数据
+                quotes_data = fetch_data(api_server, access_token, f"v1/markets/quotes?ids={symbol_ids_str}")
                 df_quotes = pd.DataFrame(quotes_data.get('quotes', []))[['symbolId', 'lastTradePrice', 'bidPrice', 'askPrice']]
+                
+                # --- 安全网 2：确保报价表里没有重复的股票 ID ---
+                df_quotes = df_quotes.drop_duplicates(subset=['symbolId'])
+                
                 df_quotes.rename(columns={'lastTradePrice': '当前最新价', 'bidPrice': '买一价', 'askPrice': '卖一价'}, inplace=True)
                 
                 # 合并数据
