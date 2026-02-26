@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 st.set_page_config(page_title="Questrade 实时量化看板", layout="wide")
-st.title("Questrade 全视角交易终端")
+st.title("📈 客户专属：Questrade 全视角交易终端")
 
 # ================= 侧边栏：账户连接 =================
 st.sidebar.header("🔑 账户连接")
@@ -38,7 +38,6 @@ else:
         st.rerun()
 
 st.sidebar.markdown("---")
-# 引入“暂停刷新”开关，方便客户在勾选/操作时画面不会突然跳动
 auto_refresh = st.sidebar.checkbox("开启数据自动刷新", value=True)
 if auto_refresh:
     refresh_rate = st.sidebar.slider("自动刷新频率 (秒)", min_value=3, max_value=30, value=5)
@@ -55,11 +54,14 @@ def place_order(api_server, access_token, account_id, symbol_id, action, qty, pr
     payload = {"symbolId": symbol_id, "primaryRoute": "AUTO", "action": action, "orderType": "Limit", "limitPrice": float(price), "totalQuantity": int(qty), "timeInForce": "GTC"}
     return requests.post(url, headers=headers, json=payload).json()
 
-# 新增：向 Questrade 发送撤单请求的函数
 def cancel_order(api_server, access_token, account_id, order_id):
     url = f"{api_server}v1/accounts/{account_id}/orders/{order_id}"
     headers = {"Authorization": f"Bearer {access_token}"}
-    return requests.delete(url, headers=headers).json()
+    response = requests.delete(url, headers=headers)
+    try:
+        return response.json()
+    except Exception:
+        return {"raw_status": response.status_code, "text": response.text}
 
 access_token = st.session_state.access_token
 api_server = st.session_state.api_server
@@ -77,7 +79,6 @@ account_id = account_dict[selected_account_name]
 tab1, tab2, tab3 = st.tabs(["💰 资产与持仓", "📝 挂单监控 & 批量撤单", "🧮 网格交易实盘引擎"])
 
 try:
-    # 抓取资产与持仓
     balances_data = fetch_data(api_server, access_token, f"v1/accounts/{account_id}/balances")
     positions_data = fetch_data(api_server, access_token, f"v1/accounts/{account_id}/positions")
     
@@ -86,14 +87,15 @@ try:
         st.warning("⚠️ 安全连接已超时 (30分钟)，请断开重新输入。")
         st.stop()
 
+    # 提取全局资产信息 (供 Tab 1 和 Tab 3 计算使用)
+    cad_cash = cad_equity = usd_cash = usd_equity = 0
+    for b in balances_data.get('combinedBalances', []):
+        if b['currency'] == 'CAD': cad_cash, cad_equity = b['cash'], b['totalEquity']
+        elif b['currency'] == 'USD': usd_cash, usd_equity = b['cash'], b['totalEquity']
+
     # ================= 渲染 Tab 1 =================
     with tab1:
         st.subheader("💳 账户综合资金概览")
-        cad_cash = cad_equity = usd_cash = usd_equity = 0
-        for b in balances_data.get('combinedBalances', []):
-            if b['currency'] == 'CAD': cad_cash, cad_equity = b['cash'], b['totalEquity']
-            elif b['currency'] == 'USD': usd_cash, usd_equity = b['cash'], b['totalEquity']
-        
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("总资产估值 (CAD)", f"${cad_equity:,.2f}")
         c2.metric("可支配现金 (CAD)", f"${cad_cash:,.2f}")
@@ -126,11 +128,9 @@ try:
         if not orders:
             st.success("过去90天内没有任何订单记录。")
         else:
-            # 核心保留 'id' 字段作为撤单依据 (底层ID)
             df_orders = pd.DataFrame(orders)[['id', 'symbolId', 'symbol', 'side', 'totalQuantity', 'limitPrice', 'state', 'updateTime']]
             df_orders['updateTime'] = pd.to_datetime(df_orders['updateTime'])
             df_orders = df_orders.sort_values(by='updateTime', ascending=True)
-            # 使用业务逻辑去重，但保留对应的最后一个订单的真实底层id
             df_orders = df_orders.drop_duplicates(subset=['symbolId', 'side', 'totalQuantity', 'limitPrice'], keep='last')
             
             if filter_symbol:
@@ -150,33 +150,40 @@ try:
             if df_orders.empty:
                 st.warning("无符合条件的挂单。")
             else:
-                # ----------------- 新增：批量撤单控制台 (Kill Switch) -----------------
-                # 提取筛选后列表里，真正属于“未成交”状态的单子
                 active_orders_to_cancel = df_orders[df_orders['state'].isin(active_states)]
                 
                 if not active_orders_to_cancel.empty:
                     with st.expander("🛑 危险操作区：批量撤销当前显示的挂单 (Kill Switch)", expanded=False):
-                        st.warning(f"基于您上方的筛选条件，当前列表中共有 **{len(active_orders_to_cancel)}** 个尚未成交的活跃订单。")
-                        
+                        st.warning(f"基于筛选条件，当前列表中共有 **{len(active_orders_to_cancel)}** 个尚未成交的订单。")
                         confirm_kill = st.checkbox("我已确认要批量撤销这些订单 (不可逆)")
                         if confirm_kill:
                             if st.button(f"🗑️ 立即向券商发送 {len(active_orders_to_cancel)} 条撤销指令", type="primary"):
                                 cancel_bar = st.progress(0, text="正在逐条发送撤单请求...")
                                 cancel_success = 0
+                                error_msgs = [] 
                                 
-                                for i, row in enumerate(active_orders_to_cancel.itertuples()):
-                                    # row.id 即为真实的 order_id
-                                    res = cancel_order(api_server, access_token, account_id, row.id)
-                                    if 'orderId' in res or (isinstance(res, dict) and 'code' not in res):
+                                for i, (index, row) in enumerate(active_orders_to_cancel.iterrows()):
+                                    real_order_id = int(row['id']) 
+                                    res = cancel_order(api_server, access_token, account_id, real_order_id)
+                                    
+                                    if isinstance(res, dict) and ('orderId' in res or 'code' not in res):
                                         cancel_success += 1
-                                    time.sleep(0.4) # 防并发限流
+                                    else:
+                                        error_msgs.append(f"底层ID {real_order_id} 撤销遭拒，API回复: {res}")
+                                        
+                                    time.sleep(0.5) 
                                     cancel_bar.progress((i + 1) / len(active_orders_to_cancel), text="正在逐条发送撤单请求...")
                                 
                                 cancel_bar.empty()
-                                st.success(f"✅ 撤单指令发送完毕！已成功发送 {cancel_success} 条。请等待几秒钟后查看表格状态更新。")
-                                time.sleep(2)
-                                st.rerun() # 发送完强制刷新页面
-                # ----------------------------------------------------------------------
+                                if cancel_success == len(active_orders_to_cancel):
+                                    st.success(f"✅ 完美执行！已成功发送 {cancel_success} 条撤单指令。")
+                                else:
+                                    st.warning(f"⚠️ 发送完毕。成功 {cancel_success} 条，失败 {len(active_orders_to_cancel) - cancel_success} 条。")
+                                    if error_msgs:
+                                        with st.expander("🔍 查看撤单失败的真实底层原因 (点击展开)", expanded=True):
+                                            for msg in error_msgs: st.write(msg)
+                                time.sleep(3)
+                                st.rerun() 
 
                 df_orders['updateTime'] = df_orders['updateTime'].dt.tz_convert('America/Toronto').dt.strftime('%m-%d %H:%M:%S')
                 df_orders.rename(columns={'id':'底层ID', 'symbol': '股票代码', 'side': '买/卖', 'totalQuantity': '数量', 'limitPrice': '挂单价格', 'state': '状态', 'updateTime': '更新时间'}, inplace=True)
@@ -189,7 +196,6 @@ try:
                 df_final = pd.merge(df_orders, df_quotes, on='symbolId', how='left').drop(columns=['symbolId'])
                 df_final['距离现价差额'] = df_final['挂单价格'] - df_final['最新价']
                 
-                # 保留底层ID列以便查错，但在展示时用更整洁的顺序
                 df_final = df_final[['更新时间', '股票代码', '买/卖', '数量', '挂单价格', '状态', '最新价', '买一价', '卖一价', '距离现价差额', '底层ID']]
                 
                 def highlight_diff(val): return '' if pd.isna(val) else (f'color: #ff4b4b; font-weight: bold' if val < 0 else f'color: #09ab3b; font-weight: bold')
@@ -221,19 +227,65 @@ try:
         st.write("✍️ **第二步：手动微调表格 (直接双击修改)**")
         df_edited = st.data_editor(df_grid_init, num_rows="dynamic", use_container_width=True)
         
+        # 抓取股票 ID 并确认币种，为运算模块做准备
         symbol_id_for_order = None
+        currency = "CAD" # 默认显示加币
         if calc_symbol:
             search_res = fetch_data(api_server, access_token, f"v1/symbols/search?prefix={calc_symbol}")
             symbols = search_res.get('symbols', [])
             if symbols:
                 matched_sym = next((s for s in symbols if s['symbol'].upper() == calc_symbol), symbols[0])
                 symbol_id_for_order = matched_sym['symbolId']
+                currency = matched_sym['currency']
+
+        # ----------------- 核心修复：加回实时运算风控模块 -----------------
+        st.write("📊 **实时运算结果与风控评估**")
+        if not df_edited.empty and calc_symbol:
+            df_edited['单笔总额'] = df_edited['挂单价格'] * df_edited['挂单股数']
+            total_shares = df_edited['挂单股数'].sum()
+            total_value = df_edited['单笔总额'].sum()
+            avg_price = total_value / total_shares if total_shares > 0 else 0
+            
+            c_calc1, c_calc2, c_calc3 = st.columns(3)
+            c_calc1.metric("网格合计总股数", f"{total_shares:,.0f} 股")
+            c_calc2.metric("网格合计总金额", f"${total_value:,.2f} {currency}")
+            c_calc3.metric("综合摊薄均价", f"${avg_price:,.3f}")
+            
+            if calc_mode == "买入 (Buy)":
+                avail_cash = usd_cash if currency == 'USD' else cad_cash
+                st.info(f"💡 **买入评估**: 当前账户可用现金为 **${avail_cash:,.2f} {currency}**。")
+                if avail_cash >= total_value:
+                    st.success(f"✅ 资金充足！批量买入后预计剩余现金: **${avail_cash - total_value:,.2f} {currency}**")
+                else:
+                    st.error(f"❌ 资金不足！您还需要充值或卖出其他股票来填补缺口: **${total_value - avail_cash:,.2f} {currency}**")
+                    
+            else: # 卖出模式
+                pos = next((p for p in positions_data.get('positions', []) if p['symbol'].upper() == calc_symbol), None)
+                if pos:
+                    current_qty = pos['openQuantity']
+                    current_avg_cost = pos['totalCost'] / current_qty if current_qty > 0 else 0
+                    
+                    st.info(f"💡 **卖出评估**: 账户当前持有 {calc_symbol} 共 **{current_qty} 股**，持仓均价约为 **${current_avg_cost:.3f}**。")
+                    if current_qty >= total_shares:
+                        rem_qty = current_qty - total_shares
+                        est_profit = total_value - (total_shares * current_avg_cost)
+                        st.success(f"✅ 持仓充足！本次卖出后将剩余 **{rem_qty} 股**。")
+                        if est_profit > 0:
+                            st.success(f"📈 喜报！预计产生净利润: **${est_profit:,.2f}**")
+                        else:
+                            st.warning(f"📉 提示：预计将产生亏损: **${est_profit:,.2f}**")
+                    else:
+                        st.error(f"❌ 持仓不足！您只持有 {current_qty} 股，无法按照当前网格卖出 {total_shares} 股。")
+                else:
+                    st.warning(f"⚠️ 账户中未查找到 {calc_symbol} 的持仓记录。如果您继续执行，可能导致失败或被视为做空。")
+        st.markdown("---")
+        # ------------------------------------------------------------------
 
         st.write("🔥 **第三步：实盘执行**")
         if not symbol_id_for_order:
             st.error("未能获取该股票的底层 ID，无法解锁交易。请检查代码拼写。")
         else:
-            unlock_trade = st.checkbox("✅ 我已确认上述网格数据绝对准确，并知晓实盘交易风险，请求解锁执行引擎。")
+            unlock_trade = st.checkbox("✅ 我已仔细查看【实时运算结果】，确认网格数据准确且知晓实盘风险，请求解锁执行引擎。")
             if unlock_trade:
                 action_str = "Buy" if calc_mode == "买入 (Buy)" else "Sell"
                 if st.button(f"🚀 立即向 Questrade 提交 {len(df_edited)} 笔 {action_str} 单", type="primary"):
@@ -254,7 +306,6 @@ try:
                     time.sleep(2)
                     st.rerun()
 
-    # 全局刷新控制：只有在侧边栏开启了“自动刷新”时，才会在底部暂停并强制重载
     if auto_refresh:
         st.caption(f"🔄 终端数据自动刷新开启中... | 最后同步时间: {time.strftime('%H:%M:%S')}")
         time.sleep(refresh_rate)
