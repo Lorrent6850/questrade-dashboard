@@ -48,6 +48,15 @@ def fetch_data(api_server, access_token, endpoint):
     response = requests.get(f"{api_server}{endpoint}", headers=headers)
     return response.json()
 
+# 🛡️ 核心修复：防空值格式化装甲 (专门应对周末和停牌)
+def safe_format(val):
+    if pd.isna(val) or val is None or val == "":
+        return "-"
+    try:
+        return f"{float(val):.2f}"
+    except:
+        return "-"
+
 access_token = st.session_state.access_token
 api_server = st.session_state.api_server
 
@@ -74,8 +83,10 @@ try:
 
     cad_cash = cad_equity = usd_cash = usd_equity = 0
     for b in balances_data.get('combinedBalances', []):
-        if b['currency'] == 'CAD': cad_cash, cad_equity = b['cash'], b['totalEquity']
-        elif b['currency'] == 'USD': usd_cash, usd_equity = b['cash'], b['totalEquity']
+        if b['currency'] == 'CAD': 
+            cad_cash, cad_equity = float(b.get('cash') or 0), float(b.get('totalEquity') or 0)
+        elif b['currency'] == 'USD': 
+            usd_cash, usd_equity = float(b.get('cash') or 0), float(b.get('totalEquity') or 0)
 
     # ================= 渲染 Tab 1 =================
     with tab1:
@@ -93,8 +104,12 @@ try:
         else:
             df_pos = pd.DataFrame(positions)[['symbol', 'openQuantity', 'currentPrice', 'totalCost', 'currentMarketValue', 'openPnl']]
             df_pos.rename(columns={'symbol': '股票代码', 'openQuantity': '持仓股数', 'currentPrice': '实时现价', 'totalCost': '已购入总价格(成本)', 'currentMarketValue': '当前总市值', 'openPnl': '净盈利(浮动盈亏)'}, inplace=True)
-            def color_pnl(val): return f"color: {'#ff4b4b' if val < 0 else '#09ab3b'}; font-weight: bold"
-            st.dataframe(df_pos.style.map(color_pnl, subset=['净盈利(浮动盈亏)']).format("{:.2f}", subset=['实时现价', '已购入总价格(成本)', '当前总市值', '净盈利(浮动盈亏)']), use_container_width=True, hide_index=True)
+            def color_pnl(val): 
+                if pd.isna(val) or val is None: return ''
+                return f"color: {'#ff4b4b' if float(val) < 0 else '#09ab3b'}; font-weight: bold"
+            
+            # 🛡️ 应用安全格式化
+            st.dataframe(df_pos.style.map(color_pnl, subset=['净盈利(浮动盈亏)']).format(safe_format, subset=['实时现价', '已购入总价格(成本)', '当前总市值', '净盈利(浮动盈亏)']), use_container_width=True, hide_index=True)
 
     # ================= 渲染 Tab 2: 挂单监控 =================
     with tab2:
@@ -143,20 +158,28 @@ try:
                 df_quotes = pd.DataFrame(quotes_data.get('quotes', []))[['symbolId', 'lastTradePrice', 'bidPrice', 'askPrice']].drop_duplicates(subset=['symbolId']).rename(columns={'lastTradePrice': '最新价', 'bidPrice': '买一价', 'askPrice': '卖一价'})
                 
                 df_final = pd.merge(df_orders, df_quotes, on='symbolId', how='left').drop(columns=['symbolId'])
-                df_final['距离现价差额'] = df_final['挂单价格'] - df_final['最新价']
+                # 安全计算差额
+                df_final['距离现价差额'] = df_final.apply(lambda row: row['挂单价格'] - row['最新价'] if pd.notna(row['最新价']) else None, axis=1)
                 
-                # 隐藏了底层 ID，表格更纯净
                 df_final = df_final[['更新时间', '股票代码', '买/卖', '数量', '挂单价格', '状态', '最新价', '买一价', '卖一价', '距离现价差额']]
                 
-                def highlight_diff(val): return '' if pd.isna(val) else (f'color: #ff4b4b; font-weight: bold' if val < 0 else f'color: #09ab3b; font-weight: bold')
-                def highlight_state(val): return 'color: #09ab3b; font-weight: bold' if val == 'Executed' else ('color: #888888' if val == 'Canceled' else 'color: #0078ff')
+                def highlight_diff(val): 
+                    if pd.isna(val) or val is None or val == "-": return ''
+                    try:
+                        return f'color: #ff4b4b; font-weight: bold' if float(val) < 0 else f'color: #09ab3b; font-weight: bold'
+                    except:
+                        return ''
+                        
+                def highlight_state(val): 
+                    return 'color: #09ab3b; font-weight: bold' if val == 'Executed' else ('color: #888888' if val == 'Canceled' else 'color: #0078ff')
                 
-                st.dataframe(df_final.style.map(highlight_diff, subset=['距离现价差额']).map(highlight_state, subset=['状态']).format("{:.2f}", subset=['挂单价格', '最新价', '买一价', '卖一价', '距离现价差额']), use_container_width=True, hide_index=True)
+                # 🛡️ 应用安全格式化
+                st.dataframe(df_final.style.map(highlight_diff, subset=['距离现价差额']).map(highlight_state, subset=['状态']).format(safe_format, subset=['挂单价格', '最新价', '买一价', '卖一价', '距离现价差额']), use_container_width=True, hide_index=True)
 
     # ================= 渲染 Tab 3: 网格量化计算器 =================
     with tab3:
         st.subheader("🧮 批量网格交易量化沙盘")
-        st.info("💡 **使用指南**：本面板为高阶决策引擎。请在此推演您的等差数列网格，系统将实时计算盈亏预估及资金占用。确认无误后，请参照此表前往 Questrade 官方端手动挂单。")
+        st.info("💡 **使用指南**：本面板为高阶决策引擎。基于 Questrade 最新 **$0 佣金**政策，系统测算的即为您的最终真实盈亏。请参照此表前往官方端手动挂单。")
         
         col_sym, col_mode = st.columns(2)
         with col_sym: calc_symbol = st.text_input("目标股票代码 (如 BDMD):", "BDMD").strip().upper()
@@ -217,7 +240,7 @@ try:
                         est_profit = total_value - (total_shares * current_avg_cost)
                         st.success(f"✅ 持仓充足！如果此网格全部成交，将剩余 **{rem_qty} 股**。")
                         if est_profit > 0:
-                            st.success(f"📈 盈利测算：预计产生净利润 **${est_profit:,.2f}**")
+                            st.success(f"📈 盈利测算：预计产生零手续费净利润 **${est_profit:,.2f}**")
                         else:
                             st.warning(f"📉 亏损测算：预计将产生亏损 **${est_profit:,.2f}**")
                     else:
@@ -233,7 +256,7 @@ try:
         st.caption(f"⏸️ 自动刷新已暂停。您可以安全地进行修改或复盘。")
 
 except Exception as e:
-    st.error(f"发生错误。这通常是由于网络波动或Token失效引起的: {e}")
+    st.error(f"发生错误。请检查网络状态或重新生成 Token。报错代码: {e}")
     if auto_refresh:
         time.sleep(refresh_rate)
         st.rerun()
